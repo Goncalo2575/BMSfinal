@@ -1,2 +1,9 @@
-../Core/Src/bms_master_comm.c:28:6:BMS_MasterComm_Init	16	static
-../Core/Src/bms_master_comm.c:37:6:BMS_MasterComm_PrintDebug	624	static
+../Core/Src/bms_master_comm.c:27:6:BMS_MasterComm_Init	16	static
+../Core/Src/bms_master_comm.c:38:6:BMS_MasterComm_Log	412	static
+../Core/Src/bms_master_comm.c:55:6:BMS_MasterComm_PrintDebug	624	static
+../Core/Src/bms_master_comm.c:114:13:send_fault_line	24	static
+../Core/Src/bms_master_comm.c:123:6:BMS_MasterComm_PrintFaults	576	static
+../Core/Src/bms_master_comm.c:175:13:print_error_context	88	static
+../Core/Src/bms_master_comm.c:190:13:print_hex	216	static
+../Core/Src/bms_master_comm.c:215:6:BMS_MasterComm_PrintDiagnostics	96	static
+../Core/Src/bms_master_comm.c:262:6:slavestesteprint	568	static

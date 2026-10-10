@@ -1,67 +1,46 @@
 /**
- * @file    main_bms_app.c
- * @brief   BMS - Aplicação Principal e Ponto de Entrada (Arquitectura Centralizada)
- *
- *  Este STM32F446RET6 monitoriza o pack (BQ79600 + 2x BQ79616) E actua a
- *  malha de segurança/relés (lógica portada da BMS do ano passado — ver
- *  bms_relays.c). A máquina de estados SAFE/ENGAGED/CHARGING/NOT_SAFE comanda
- *  pré-carga, descarga, relé do carregador, BMS_relay/BMS_charge e o LED cluster.
- *
- *  ⚠ Isto SUPERSEDE a nota "decide e reporta, sem actuação" da v3.2.0: este MCU
- *  passou a ser o actuador dos relés. Actualizar o FMEA/FTA.
- *
- *  PINOUT (ver bms_relays.h para o mapa completo e conflitos a confirmar):
- *    PA0/PA1 UART4 (bridge)   PA2/PA3 USART2 (debug TX)   PA8 NFAULT
- *    Relés:  PC0 pré-carga  PC1 charge  PC2 descarga  PC4 BMS_relay  PA6 BMS_charge
- *    LED:    PA15 verde  PC11 vermelho  PC12 azul
- *    Monitor:PB0 IMD  PC8 TSMS  PC6 ESDB  PB14 ESDB_chg  PB12 charger_sig
- *
- *  CONFIG CubeMX (84 MHz): ver bms_relays.h e a nota abaixo.
- *  SYS Debug = Trace Asynchronous SW (reserva PA13=SWDIO, PA14=SWCLK, PB3=SWO;
- *  liberta PA15/JTDI para o LED verde). IWDG ~500 ms (a pré-carga do ENGAGED
- *  é não-bloqueante).
- *
- * @version 3.3.0
+ * @file main_bms_app.c
+ * @brief Aplicacao de bancada. Chamadas antes comentadas permanecem comentadas.
+ * A inibicao do driver e LOGICA; esta versao nao passa a accionar reles.
  */
-
 #include "bq796xx_bms.h"
 #include "bms_master_comm.h"
 #include "bms_relays.h"
 #include <stdio.h>
 #include <stdbool.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define BMS_APP_UNUSED __attribute__((unused))
+#else
+#define BMS_APP_UNUSED
+#endif
+
 /* =========================================================================
  * VARIÁVEIS GLOBAIS DA APLICAÇÃO
  * ========================================================================= */
 
-static BMS_Handle_t      g_bms;
-BMS_MasterComm_t         g_master_comm;
+static BMS_Handle_t g_bms;
+BMS_MasterComm_t g_master_comm;
 
-extern UART_HandleTypeDef  huart4;   /* UART4 — BQ79600 bridge (PA0/PA1) */
-extern UART_HandleTypeDef  huart2;   /* USART2 (PA2/PA3) — debug/telemetria TX-only */
-extern TIM_HandleTypeDef   htim2;    /* TIM2  — Delay µs (contador livre) */
+extern UART_HandleTypeDef huart4; /* UART4 — BQ79600 bridge (PA0/PA1) */
+extern UART_HandleTypeDef huart2; /* USART2 (PA2/PA3) — debug/telemetria TX-only */
+extern TIM_HandleTypeDef htim2;   /* TIM2  — Delay µs (contador livre) */
 
-#define BMS_TASK_PERIOD_MS   100U
+/* BMS_TASK_PERIOD_MS definido no header comum. */
 
 /* =========================================================================
  * FUNÇÕES DE APOIO À APLICAÇÃO
  * ========================================================================= */
 
 /**
- * @brief  Mantém a expectativa interna de "tração activa" (contactor_closed)
+ * @brief Aplica a decisao logica de contactor a partir do estado do BMS.
  *
- * Para que serve: mantém contactor_closed coerente com o estado do BMS. NÃO
- * comanda contactores nem pinos — o Line_contactor é fechado pelo INVERSOR
- * (Sevcon Gen4 Size 6) quando B+ atinge o limiar programado. Esta flag serve só
- * para (a) gating do cálculo de SoC e (b) telemetria/reporte por evento.
- *
- * Como funciona: se houver NFAULT pendente sai logo. Caso contrário, marca
- * "tração activa" em operação normal (MONITORING ou BALANCING, sem falhas) e
- * desde que NÃO esteja a carregar — passando pelas barreiras de
- * BMS_ContactorClose — e "inactiva" em qualquer outro caso (incluindo CHARGING,
- * por separação total tração/carga — D.5.3.7).
+ * Com NFAULT pendente nao tenta fechar. Em monitorizacao/balanceamento sem
+ * falhas e fora de carregamento, pede o fecho logico atraves dos interlocks;
+ * nas restantes condicoes pede abertura logica. A chamada esta comentada no
+ * super-loop de bancada. Nao e um comando directo para um rele GPIO.
  */
-static void BMS_ContactorControl(BMS_Handle_t *hbms)
+static void BMS_APP_UNUSED BMS_ContactorControl(BMS_Handle_t *hbms)
 {
     if (__atomic_load_n(&hbms->nfault_pending, __ATOMIC_SEQ_CST) != 0U)
     {
@@ -71,143 +50,150 @@ static void BMS_ContactorControl(BMS_Handle_t *hbms)
     bool charging = (BMS_Relays_GetState() == BMS_RLY_CHARGING);
 
     if (!charging &&
-        ((hbms->state == BMS_STATE_MONITORING) ||
-         (hbms->state == BMS_STATE_BALANCING)) &&
+        ((hbms->state == BMS_STATE_MONITORING) || (hbms->state == BMS_STATE_BALANCING)) &&
         (hbms->fault_flags == BMS_FAULT_NONE))
     {
         if (!hbms->contactor_closed)
         {
-            BMS_ContactorClose(hbms);   /* Barreiras internas reforçam aqui */
+            BMS_ContactorClose(hbms); /* Barreiras internas reforçam aqui */
         }
     }
     else
     {
         if (hbms->contactor_closed)
         {
-            BMS_ContactorOpen(hbms);    /* inclui CHARGING → tração inactiva */
+            BMS_ContactorOpen(hbms); /* inclui CHARGING → tração inactiva */
         }
     }
 }
 
 /**
- * @brief  Limpa os registos de latch de falha em todos os dispositivos
+ * @brief Delega a limpeza dos latches no driver BQ.
  *
- * Para que serve: passo obrigatório antes de tentar voltar a MONITORING após
- * uma falha. Os BQ79616/BQ79600 retêm (latch) as falhas em hardware; sem este
- * clear, o NFAULT voltaria a disparar de imediato.
+ * Para que serve: manter um ponto unico de tratamento dos enderecos correctos
+ * da bridge e dos slaves.
  *
- * Como funciona: escreve 0xFF em FAULT_RST1/RST2 por broadcast (slaves) e, como
- * o broadcast não chega à bridge, repete em single-write para a bridge.
+ * Nao confirma a ausencia de falha; a recuperacao volta a ler as causas.
  */
 static BMS_Status_t BMS_ClearHardwareFaultLatches(BMS_Handle_t *hbms)
 {
-    uint8_t      clear_val = FAULT_CLEAR_VAL;  /* 0xFF */
-    BMS_Status_t status;
-
-    status = BMS_WriteBroadcast(hbms, REG_FAULT_RST1, &clear_val, 1U);
-    if (status != BMS_OK) { return status; }
-
-    status = BMS_WriteBroadcast(hbms, REG_FAULT_RST2, &clear_val, 1U);
-    if (status != BMS_OK) { return status; }
-
-    /* Latches da Bridge (Broadcast não chega à bridge — precisa Single) */
-    (void)BMS_WriteSingleDevice(hbms, BMS_ADDR_BRIDGE,
-                                REG_FAULT_RST1, &clear_val, 1U);
-    (void)BMS_WriteSingleDevice(hbms, BMS_ADDR_BRIDGE,
-                                REG_FAULT_RST2, &clear_val, 1U);
-
-    return BMS_OK;
+    return BMS_ClearFaultLatches(hbms);
 }
 
 /**
- * @brief  Tentativa de recuperação automática a partir do estado FAULT
+ * @brief Tenta recuperar apenas falhas transitorias de comunicacao.
  *
- * Para que serve: dá ao sistema a hipótese de recuperar de falhas transitórias
- * (ex.: ring break recuperável) sem intervenção humana, mas SEM nunca religar
- * sobre uma condição perigosa.
+ * Para que serve: voltar a adquirir os dois slaves depois de revalidar o transporte.
  *
- * Como funciona:
- *  - Limita as tentativas: à 4ª (retry > 3) desiste e adormece o pack em
- *    segurança (BMS_EnterSleep), evitando o ciclo infinito FAULT→SHUTDOWN→FAULT.
- *  - Reavalia tensões/temperaturas e marca como NÃO recuperável se a grandeza
- *    em falha ainda está perto do limite (OV/UV/OT), ou se a falha é física
- *    (open-wire) ou de comunicação total.
- *  - Só se recuperável: limpa os latches de hardware, zera as flags por célula
- *    e regressa a MONITORING (reabilitando a decisão de fechar o contactor).
+ * Como funciona: limita tentativas; verifica caminho/configuracao; le tensoes;
+ * reavalia limites; limpa latches; confirma hardware e repete o POST.
+ *
+ * OV/UV, sensores e configuracao nao sao apagados por esta recuperacao
+ * automatica. Mantem todas as chamadas ja comentadas sem execucao.
  */
-static void BMS_FaultRecoveryAttempt(BMS_Handle_t *hbms,
-                                      uint32_t *retry_counter)
+static void BMS_FaultRecoveryAttempt(BMS_Handle_t *hbms, uint32_t *retry_counter)
 {
-    (*retry_counter)++;
-
-    if (*retry_counter > 3U)
+    if (hbms == NULL || retry_counter == NULL)
     {
-        /* Adormece fisicamente o barramento; o guard de SLEEP em
-         * BMS_Task_100ms quebra o ciclo infinito FAULT→SHUTDOWN→FAULT. */
-        BMS_EnterSleep(hbms);
         return;
     }
-
-    BMS_ReadAllCellVoltages(hbms);
-    BMS_ReadAllTemperatures(hbms);
-
-    bool recoverable = true;
-
-    if ((hbms->fault_flags & BMS_FAULT_OV) &&
-        (hbms->max_cell_mv > (CELL_OV_MV - 50U)))
+    BMS_InhibitOutputs(hbms);
+    /* Rearme automatico SO para falhas transitorias de comunicacao.
+     * Primeiro classificar; uma falha permanente NAO consome tentativas. */
+    const uint32_t recoverable_mask =
+        BMS_FAULT_COMM | BMS_FAULT_RING_BREAK | BMS_FAULT_CRC | BMS_FAULT_FRAME | BMS_FAULT_HB_FAIL;
+    if ((hbms->fault_flags & ~recoverable_mask) != 0U)
     {
-        recoverable = false;
+        return;
     }
-    if ((hbms->fault_flags & BMS_FAULT_UV) &&
-        (hbms->min_cell_mv < (CELL_UV_MV + 50U)))
+    if (*retry_counter >= BMS_RECOVERY_MAX_ATTEMPTS)
     {
-        recoverable = false;
+#if BMS_BENCH_MODE
+        /* Bancada: manter FAULT e todo o historico para diagnostico. */
+        return;
+#else
+        BMS_EnterSleep(hbms);
+        return;
+#endif
     }
-    if ((hbms->fault_flags & BMS_FAULT_OT) &&
-        (hbms->max_temp_c > (int16_t)(CELL_TEMP_MAX_C - 5)))
+    ++*retry_counter;
+    if (!hbms->direction_valid || (hbms->fault_flags & BMS_FAULT_RING_BREAK) != 0U)
     {
-        recoverable = false;
-    }
-    /* Open Wire: falha física — não recuperável por software */
-    if (hbms->fault_flags & BMS_FAULT_OPEN_WIRE)
-    {
-        recoverable = false;
-    }
-    /* Falha de comunicação total: não recuperável sem re-init */
-    if ((hbms->fault_flags & BMS_FAULT_COMM) &&
-        !(hbms->fault_flags & BMS_FAULT_RING_BREAK))
-    {
-        recoverable = false;
-    }
-
-    if (recoverable)
-    {
-        /* Limpar latches de hardware ANTES de transitar para MONITORING. */
-        if (BMS_ClearHardwareFaultLatches(hbms) != BMS_OK)
+        if (BMS_RingRecovery(hbms) != BMS_OK)
         {
-            hbms->fault_flags |= BMS_FAULT_COMM;
             return;
         }
-
-        for (uint8_t s = 0U; s < BMS_NUM_SLAVES; s++)
-        {
-            hbms->slave[s].fault_flags = 0U;
-            for (uint8_t c = 0U; c < BMS_CELLS_PER_SLAVE; c++)
-            {
-                hbms->slave[s].ov_cell[c] = false;
-                hbms->slave[s].uv_cell[c] = false;
-            }
-        }
-
-        hbms->fault_flags &= ~(BMS_FAULT_OV  |
-                                BMS_FAULT_UV  |
-                                BMS_FAULT_OT  |
-                                BMS_FAULT_HB_FAIL |
-                                BMS_FAULT_CRC);
-
-        hbms->state    = BMS_STATE_MONITORING;
-        *retry_counter = 0U;
     }
+    BMS_Status_t verify_status = BMS_VerifyConfiguration(hbms);
+    if (verify_status != BMS_OK)
+    {
+        /* Um timeout pode acontecer sem NFAULT/RING_BREAK. Tentar DIR1
+         * apenas para erros de transporte, nunca para configuracao invalida. */
+        if (verify_status != BMS_ERR_COMM && verify_status != BMS_ERR_TIMEOUT &&
+            verify_status != BMS_ERR_CRC && verify_status != BMS_ERR_FRAME)
+        {
+            return;
+        }
+        if (BMS_RingRecovery(hbms) != BMS_OK)
+        {
+            return;
+        }
+    }
+    if (BMS_ReadAllCellVoltages(hbms) != BMS_OK)
+    {
+        return;
+    }
+    //BMS_ReadAllTemperatures(hbms);
+    /* Nao activar aqui, por outro caminho, a aquisicao que ficou comentada.
+     * Em operacional exige-se que o chamador tenha fornecido dados recentes. */
+    if (!BMS_MeasurementsFresh(hbms, BMS_BENCH_MODE == 0U, BMS_BENCH_MODE == 0U))
+    {
+        return;
+    }
+    /* Reavaliar TODAS as proteccoes, nao apenas a categoria da falha antiga. */
+    (void)BMS_CheckProtections(hbms);
+    if ((hbms->fault_flags & ~recoverable_mask) != 0U || hbms->min_cell_mv <= CELL_UV_MV + 50U ||
+        hbms->max_cell_mv >= CELL_OV_MV - 50U ||
+        (hbms->temperature_valid && hbms->max_temp_c >= (int16_t)(CELL_TEMP_MAX_C - 5U)))
+    {
+        return;
+    }
+    /* Conservar a falha anterior caso a revalidacao/POST nao conclua o rearme. */
+    uint32_t saved_flags = hbms->fault_flags;
+    BMS_Status_t clear_status = BMS_ClearHardwareFaultLatches(hbms);
+    if (clear_status != BMS_OK)
+    {
+        hbms->fault_flags |= BMS_FaultForStatus(clear_status);
+        return;
+    }
+    BMS_DelayMs(10U);
+    uint32_t faults = 0U;
+    BMS_Status_t scan_status = BMS_ScanHardwareFaults(hbms, &faults);
+    if (scan_status != BMS_OK || faults != 0U)
+    {
+        hbms->fault_flags |= faults | BMS_FaultForStatus(scan_status);
+        return;
+    }
+    if (HAL_GPIO_ReadPin(BMS_NFAULT_PORT, BMS_NFAULT_PIN) != GPIO_PIN_SET)
+    {
+        return;
+    }
+    /* Continuamos inibidos ate ao POST. Nao se publica BMS_OK entre etapas. */
+    hbms->fault_flags = 0U;
+    for (uint8_t s = 0U; s < BMS_NUM_SLAVES; ++s)
+    {
+        hbms->slave[s].fault_flags = 0U;
+        memset(hbms->slave[s].ov_cell, 0, sizeof(hbms->slave[s].ov_cell));
+        memset(hbms->slave[s].uv_cell, 0, sizeof(hbms->slave[s].uv_cell));
+    }
+    hbms->state = BMS_STATE_MONITORING;
+    if (BMS_PowerOnSelfTest(hbms) != BMS_OK)
+    {
+        hbms->fault_flags |= saved_flags;
+        BMS_EmergencyShutdown(hbms);
+        return;
+    }
+    *retry_counter = 0U;
 }
 
 /* =========================================================================
@@ -215,77 +201,116 @@ static void BMS_FaultRecoveryAttempt(BMS_Handle_t *hbms,
  * ========================================================================= */
 
 /**
- * @brief  Ponto de entrada da aplicação BMS (chamado de main.c, USER CODE BEGIN 2)
+ * @brief Ponto de entrada da aplicacao de ensaio dos slaves.
  *
- * Para que serve: é o "main" funcional do BMS. Põe o hardware em estado seguro,
- * inicializa a daisy-chain, corre o auto-teste e entra no super-loop que
- * monitoriza o pack e actua a malha de segurança/relés indefinidamente.
+ * Para que serve: orquestrar inicializacao, POST, aquisicao a 100 ms e debug a 1 Hz.
  *
- * Como funciona (fases):
- *  FASE 1  — Relés/LED em estado seguro (ANTES de tudo), depois BMS_Init. Se o
- *            init falhar, fica num loop que NÃO refresca o IWDG de propósito:
- *            o watchdog (~500 ms) reseta e re-tenta (auto-recuperação Via B).
- *  FASE 1b — Telemetria USART2 (TX-only).
- *  FASE 1c — IWDG já armado pelo CubeMX; aqui só se anuncia.
- *  FASE 1d — POST (CRC/Comm/ADC/NFAULT).
- *  FASE 2  — Leituras iniciais (incl. tensão do bus) e decisão lógica inicial
- *            de contactor; 1ª passagem da malha de relés + reporte inicial.
- *  FASE 3  — Super-loop: em TODAS as iterações refresca o IWDG e corre
- *            BMS_Relays_Task (debounce, blink 1 Hz, pré-carga não-bloqueante);
- *            processa NFAULT fora da cadência (propagando logo aos relés);
- *            a cada 100 ms corre BMS_Task_100ms + decisão de contactor, reporta
- *            por evento (mudança de contactor/BMS_OK), gere o recovery em FAULT
- *            (50 ciclos, máx. 3 tentativas) e envia o heartbeat de telemetria a 1 Hz.
+ * Como funciona: usa UART4/TIM2 ja configurados em main.c; inicializa os BQ;
+ * entra no super-loop e mostra S1/S2. Em erro de arranque regista etapa,
+ * dispositivo, registo e resultado. Em bancada mantem o diagnostico e
+ * refresca o watchdog; fora desse modo, init-fail aguarda o reset IWDG.
+ *
+ * As chamadas comentadas no arranque e no ciclo permanecem desactivadas.
+ * slaves_ok indica aquisicao verificada; nao e a permissao global bms_ok.
  */
 void BMS_Main(void)
 {
     BMS_Status_t status;
-    uint32_t     fault_cycle_count  = 0U;   /* ciclos em FAULT desde a última transição */
-    uint32_t     fault_retry_count  = 0U;   /* tentativas de recovery efectuadas */
-    uint32_t     debug_print_div    = 0U;
-    uint32_t     last_task_tick;            /* timestamp do último ciclo de 100 ms */
-    bool         last_contactor_decision;   /* p/ reporte por evento (FTTI) */
-    bool         last_bms_ok;
+    uint32_t fault_cycle_count = 0U;      /* ciclos em FAULT desde a última transição */
+    uint32_t fault_retry_count = 0U;      /* tentativas de recovery efectuadas */
+    uint32_t last_task_tick;              /* timestamp do último ciclo de 100 ms */
+    bool last_contactor_decision = false; /* p/ reporte por evento (FTTI) */
+    bool last_bms_ok = false;
+    uint32_t last_recovery_tick = 0U;
+    uint32_t last_fault_report_tick = 0U;
+    uint32_t last_reported_fault_flags = 0xFFFFFFFFUL;
+    BMS_State_t last_reported_state = BMS_STATE_UNINITIALIZED;
+    (void)last_contactor_decision;
+    (void)last_bms_ok;
 
     /* ------------------------------------------------------------------
      * FASE 1: Inicialização do BMS
      * ------------------------------------------------------------------ */
-    printf("\r\n[BMS] Firmware v%s\r\n", BMS_FW_VERSION_STRING);
-    printf("[BMS] Config: %u slaves x %u cells = %u total\r\n",
-           BMS_NUM_SLAVES, BMS_CELLS_PER_SLAVE, BMS_TOTAL_CELLS);
+    /* USART2 ja foi inicializada em main.c antes de BMS_Main. O logger directo
+     * nao depende de _write/printf e nunca aceita UART4. */
+    BMS_MasterComm_Init(&g_master_comm, &huart2);
+    BMS_MasterComm_Log(&g_master_comm,
+                       "\r\n[BMS] Firmware %u.%u.%u BENCH=%u thresholds=%u/%umV\r\n",
+                       (unsigned)BMS_FW_VERSION_MAJOR,
+                       (unsigned)BMS_FW_VERSION_MINOR,
+                       (unsigned)BMS_FW_VERSION_PATCH,
+                       (unsigned)BMS_BENCH_MODE,
+                       (unsigned)CELL_UV_MV,
+                       (unsigned)CELL_OV_MV);
+    BMS_MasterComm_Log(&g_master_comm,
+                       "[BMS] Config: %u slaves x %u cells = %u total\r\n",
+                       (unsigned)BMS_NUM_SLAVES,
+                       (unsigned)BMS_CELLS_PER_SLAVE,
+                       (unsigned)BMS_TOTAL_CELLS);
 
-    /* Relés + LED em estado seguro ANTES de tudo (BMS relay fechado, contactores
-     * abertos, LEDs apagados). Independente do CubeMX. */
+    /* A inicializacao dos reles abaixo continua desactivada.
+     * Nao presumir nenhum estado electrico seguro a partir deste comentario. */
+
+    /*          
     BMS_Relays_Init();
     printf("[BMS] Relays/LED init OK (safe-state)\r\n");
+    */
 
     status = BMS_Init(&g_bms, &huart4, &htim2);
     if (status != BMS_OK)
     {
-        printf("[BMS] FATAL: Initialization failed! Code: %d\r\n", (int)status);
-        /* AUTO-RECUPERAÇÃO (Via B): este loop NÃO refresca o IWDG de propósito.
-         * O watchdog (armado pelo CubeMX) dispara ao fim de ~500 ms e reinicia
-         * o MCU, que volta a tentar BMS_Init. NÃO adicionar BMS_IWDG_Refresh. */
+        /* A tentativa terminou; reservar o orcamento do IWDG para o dump. */
+        BMS_IWDG_Refresh();
+        BMS_MasterComm_Log(&g_master_comm,
+                           "[BMS] INIT FAIL status=%s step=%s last=%s dev=%02X reg=%04X\r\n",
+                           BMS_GetStatusString(status),
+                           g_bms.init_step ? g_bms.init_step : "UNKNOWN",
+                           BMS_GetStatusString(g_bms.last_error_status),
+                           (unsigned)g_bms.last_error_device,
+                           (unsigned)g_bms.last_error_reg);
+        BMS_MasterComm_PrintFaults(&g_master_comm, &g_bms);
+        BMS_MasterComm_PrintDiagnostics(&g_master_comm, &g_bms);
+#if BMS_BENCH_MODE && BMS_BENCH_HOLD_ON_INIT_FAILURE
+        /* Para diagnostico de bancada NAO perder FIRST/LAST por reset de IWDG.
+         * Nao se fazem novas transaccoes UART4 neste estado. */
+        uint32_t last_print = HAL_GetTick();
+        while (1U)
+        {
+            BMS_IWDG_Refresh();
+            if ((uint32_t)(HAL_GetTick() - last_print) >= BMS_DEBUG_REPEAT_MS)
+            {
+                last_print = HAL_GetTick();
+                BMS_MasterComm_Log(&g_master_comm, "[BMS] INIT FAIL mantido para debug\r\n");
+                BMS_MasterComm_PrintDiagnostics(&g_master_comm, &g_bms);
+            }
+            BMS_DelayMs(10U);
+        }
+#else
         while (1U)
         {
             BMS_DelayMs(200U);
-        }
+        } /* IWDG provoca nova tentativa. */
+#endif
     }
 
-    printf("[BMS] Initialization OK. State: %s\r\n",
-           BMS_GetStateString(g_bms.state));
-    printf("[BMS] Ring intact: %s\r\n", g_bms.ring_intact ? "YES" : "NO");
+    BMS_MasterComm_Log(&g_master_comm,
+                       "[BMS] Initialization OK state=%s ring=%s\r\n",
+                       BMS_GetStateString(g_bms.state),
+                       g_bms.ring_intact ? "YES" : "NO");
 
     /* ------------------------------------------------------------------
      * FASE 1b: Inicializar saída de debug/telemetria (USART2, TX-only)
      * ------------------------------------------------------------------ */
-    BMS_MasterComm_Init(&g_master_comm, &huart2);
-    printf("[BMS] Telemetry/debug init OK (USART2 PA2/PA3, TX-only)\r\n");
+
+    BMS_MasterComm_Log(&g_master_comm,
+                       "[BMS] Debug USART2 activo (PA2 TX, baud=%lu)\r\n",
+                       (unsigned long)huart2.Init.BaudRate);
 
     /* ------------------------------------------------------------------
-     * FASE 1c: IWDG Watchdog (ASIL-D) — armado pelo CubeMX (MX_IWDG_Init).
+     * FASE 1c: IWDG Watchdog (supervisao de bloqueio) — armado pelo CubeMX (MX_IWDG_Init).
      * ------------------------------------------------------------------ */
-    printf("[BMS] IWDG active (CubeMX MX_IWDG_Init, timeout ~500 ms)\r\n");
+    BMS_MasterComm_Log(&g_master_comm,
+                       "[BMS] IWDG: requer MX_IWDG_Init; BENCH preserva init-fail para debug\r\n");
 
     /* ------------------------------------------------------------------
      * FASE 1d: Power-On Self Test (POST)
@@ -293,13 +318,17 @@ void BMS_Main(void)
     status = BMS_PowerOnSelfTest(&g_bms);
     if (status != BMS_OK)
     {
-        printf("[BMS] POST FAILED! Fault: %s\r\n",
-               BMS_GetFaultString(g_bms.fault_flags));
+        BMS_MasterComm_Log(&g_master_comm,
+                           "[BMS] POST FAILED fault=%s (0x%08lX)\r\n",
+                           BMS_GetFaultString(g_bms.fault_flags),
+                           (unsigned long)g_bms.fault_flags);
+        BMS_MasterComm_PrintFaults(&g_master_comm, &g_bms);
+        BMS_MasterComm_PrintDiagnostics(&g_master_comm, &g_bms);
         g_bms.state = BMS_STATE_FAULT;
     }
     else
     {
-        printf("[BMS] POST passed (CRC, Comm, ADC, NFAULT all OK)\r\n");
+        BMS_MasterComm_Log(&g_master_comm, "[BMS] POST basico OK (bridge/slaves)\r\n");
     }
 
     /* ------------------------------------------------------------------
@@ -307,33 +336,48 @@ void BMS_Main(void)
      *          actuação física é do módulo de relés).
      * ------------------------------------------------------------------ */
     BMS_DelayMs(100U);
-    BMS_ReadAllCellVoltages(&g_bms);
-    BMS_ReadAllTemperatures(&g_bms);
-    BMS_ReadInverterVoltage(&g_bms);          /* tensão do bus p/ pré-carga */
-    BMS_UpdateHardwareInterlocks(&g_bms);     /* calcula bms_ok inicial */
-
-    if ((g_bms.fault_flags == BMS_FAULT_NONE) && (g_bms.post_passed))
+    status = BMS_ReadAllCellVoltages(&g_bms);
+    if (status != BMS_OK)
     {
-        printf("[BMS] Conditions OK at startup.\r\n");
-        BMS_ContactorClose(&g_bms);
+        BMS_EmergencyShutdown(&g_bms);
     }
     else
     {
-        printf("[BMS] Startup with fault: %s\r\n",
-               BMS_GetFaultString(g_bms.fault_flags));
+        (void)BMS_CheckProtections(&g_bms);
+    }
+    //BMS_ReadAllTemperatures(&g_bms);
+    //BMS_ReadInverterVoltage(&g_bms);          /* tensão do bus p/ pré-carga *
+    BMS_UpdateHardwareInterlocks(&g_bms); /* calcula bms_ok inicial */
+
+    if ((g_bms.fault_flags == BMS_FAULT_NONE) && (g_bms.post_passed))
+    {
+        BMS_MasterComm_Log(&g_master_comm,
+                           "[BMS] Aquisicao inicial OK; BMS_OK=%u (bench=0 esperado)\r\n",
+                           (unsigned)g_bms.bms_ok);
+        //BMS_ContactorClose(&g_bms);
+    }
+    else
+    {
+        BMS_MasterComm_Log(&g_master_comm,
+                           "[BMS] Startup fault=%s (0x%08lX)\r\n",
+                           BMS_GetFaultString(g_bms.fault_flags),
+                           (unsigned long)g_bms.fault_flags);
     }
 
     /* Primeira passagem da malha de segurança/relés + reporte inicial */
-    BMS_Relays_Task(&g_bms, HAL_GetTick());
-    BMS_MasterComm_PrintDebug(&g_master_comm, &g_bms);
-    last_contactor_decision = g_bms.contactor_closed;
-    last_bms_ok             = g_bms.bms_ok;
+    //BMS_Relays_Task(&g_bms, HAL_GetTick());
+    //BMS_MasterComm_PrintDebug(&g_master_comm, &g_bms);
+    slavestesteprint(&g_master_comm, &g_bms);
+    last_fault_report_tick = HAL_GetTick();
+    last_reported_fault_flags = g_bms.fault_flags;
+    last_reported_state = g_bms.state;
+    //last_contactor_decision = g_bms.contactor_closed;
+    last_bms_ok = g_bms.bms_ok;
 
     /* ------------------------------------------------------------------
      * FASE 3: Super-loop de operação
      * ------------------------------------------------------------------ */
-    printf("[BMS] Entering monitoring loop. Safety state: %s\r\n",
-           BMS_Relays_GetStateString());
+    //printf("[BMS] Entering monitoring loop. Safety state: %s\r\n", BMS_Relays_GetStateString());
 
     last_task_tick = HAL_GetTick();
 
@@ -342,22 +386,35 @@ void BMS_Main(void)
         /* IWDG: refrescar em TODAS as iterações (independente do tick). */
         BMS_IWDG_Refresh();
 
-        /* MALHA DE SEGURANÇA / RELÉS + LED: corre em TODAS as iterações
-         * (debounce dos monitores, blink 1 Hz, pré-carga não-bloqueante). */
-        BMS_Relays_Task(&g_bms, HAL_GetTick());
+        /* Malha de reles mantida comentada: nao ha actuacao fisica aqui. */
+        //BMS_Relays_Task(&g_bms, HAL_GetTick());
 
-        /* NFAULT fora do tick — processamento imediato. */
-        if (__atomic_load_n(&g_bms.nfault_pending, __ATOMIC_SEQ_CST) != 0U)
+        /* Inibicao imediata; a cadencia UART e central em BMS_ProcessFaults. */
+        BMS_UpdateHardwareInterlocks(&g_bms);
+        if (g_bms.state != BMS_STATE_SHUTDOWN && g_bms.state != BMS_STATE_SLEEP &&
+            BMS_NfaultIsActive(&g_bms))
         {
-            BMS_ProcessFaults(&g_bms);
+            BMS_InhibitOutputs(&g_bms);
+            /* Chamada original continua comentada. Numa futura integracao,
+             * o corte fisico tem prioridade sobre o diagnostico UART. */
+            //BMS_Relays_Task(&g_bms, HAL_GetTick());
+            (void)BMS_ProcessFaults(&g_bms);
 
-            /* Propagar de imediato à malha de relés (abre BMS relay etc.). */
-            BMS_Relays_Task(&g_bms, HAL_GetTick());
-
-            BMS_MasterComm_PrintDebug(&g_master_comm, &g_bms);
-            last_contactor_decision = g_bms.contactor_closed;
-            last_bms_ok             = g_bms.bms_ok;
-            debug_print_div         = 0U;
+            //BMS_MasterComm_PrintDebug(&g_master_comm, &g_bms);
+            /* Debug imediato apenas se a causa/estado mudou; caso contrario
+             * o heartbeat de 1 s mostra o mesmo snapshot sem saturar USART2. */
+            uint32_t now_dbg = HAL_GetTick();
+            if (g_bms.fault_flags != last_reported_fault_flags ||
+                g_bms.state != last_reported_state ||
+                (uint32_t)(now_dbg - last_fault_report_tick) >= BMS_DEBUG_REPEAT_MS)
+            {
+                slavestesteprint(&g_master_comm, &g_bms);
+                last_fault_report_tick = now_dbg;
+                last_reported_fault_flags = g_bms.fault_flags;
+                last_reported_state = g_bms.state;
+            }
+            //last_contactor_decision = g_bms.contactor_closed;
+            last_bms_ok = g_bms.bms_ok;
         }
 
         /* Cadência de 100 ms via HAL_GetTick (base TIM6). */
@@ -366,15 +423,20 @@ void BMS_Main(void)
             BMS_DelayMs(1U);
             continue;
         }
-        last_task_tick += BMS_TASK_PERIOD_MS;   /* cadência sem deriva acumulada */
+        last_task_tick = HAL_GetTick(); /* Nao recuperar atrasos com rajadas de ciclos. */
 
         /* TAREFA PRINCIPAL DO BMS @ 100 ms */
         status = BMS_Task_100ms(&g_bms);
+        if (status != BMS_OK)
+        {
+            BMS_InhibitOutputs(&g_bms);
+        }
+        (void)last_bms_ok;
 
         /* Decisão LÓGICA de contactor (gating de SoC/telemetria) */
-        BMS_ContactorControl(&g_bms);
+        //BMS_ContactorControl(&g_bms);
 
-        /* REPORTE POR EVENTO: se a decisão de contactor ou o BMS_OK mudaram. */
+        /* REPORTE POR EVENTO: se a decisão de contactor ou o BMS_OK mudaram. 
         if ((g_bms.contactor_closed != last_contactor_decision) ||
             (g_bms.bms_ok           != last_bms_ok))
         {
@@ -382,16 +444,20 @@ void BMS_Main(void)
             last_contactor_decision = g_bms.contactor_closed;
             last_bms_ok             = g_bms.bms_ok;
             debug_print_div         = 0U;
-        }
+        }*/
 
         /* GESTÃO DE RECOVERY EM ESTADO FAULT */
         if (g_bms.state == BMS_STATE_FAULT)
         {
-            fault_cycle_count++;
-
-            if ((fault_cycle_count >= 50U) && (fault_retry_count <= 3U))
+            if (fault_cycle_count == 0U)
             {
-                fault_cycle_count = 0U;
+                fault_cycle_count = 1U;
+                last_recovery_tick = HAL_GetTick();
+            }
+            if ((uint32_t)(HAL_GetTick() - last_recovery_tick) >= BMS_RECOVERY_PERIOD_MS &&
+                fault_retry_count < BMS_RECOVERY_MAX_ATTEMPTS)
+            {
+                last_recovery_tick = HAL_GetTick();
                 BMS_FaultRecoveryAttempt(&g_bms, &fault_retry_count);
             }
         }
@@ -401,12 +467,16 @@ void BMS_Main(void)
             fault_retry_count = 0U;
         }
 
-        /* HEARTBEAT DE TELEMETRIA @ 1 Hz (a cada 10 ciclos de 100 ms) */
-        debug_print_div++;
-        if (debug_print_div >= 10U)
+        /* Reportar tambem falhas de software sem flanco NFAULT. Cadencia real,
+         * independente de quantos ciclos se perderam em UART/recuperacao. */
+        if (g_bms.fault_flags != last_reported_fault_flags || g_bms.state != last_reported_state ||
+            (uint32_t)(HAL_GetTick() - last_fault_report_tick) >= BMS_DEBUG_REPEAT_MS)
         {
-            debug_print_div = 0U;
-            BMS_MasterComm_PrintDebug(&g_master_comm, &g_bms);
+            //BMS_MasterComm_PrintDebug(&g_master_comm, &g_bms);
+            slavestesteprint(&g_master_comm, &g_bms);
+            last_fault_report_tick = HAL_GetTick();
+            last_reported_fault_flags = g_bms.fault_flags;
+            last_reported_state = g_bms.state;
         }
     }
 }

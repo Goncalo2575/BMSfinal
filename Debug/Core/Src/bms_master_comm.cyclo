@@ -1,2 +1,9 @@
-../Core/Src/bms_master_comm.c:28:6:BMS_MasterComm_Init	3
-../Core/Src/bms_master_comm.c:37:6:BMS_MasterComm_PrintDebug	19
+../Core/Src/bms_master_comm.c:27:6:BMS_MasterComm_Init	4
+../Core/Src/bms_master_comm.c:38:6:BMS_MasterComm_Log	7
+../Core/Src/bms_master_comm.c:55:6:BMS_MasterComm_PrintDebug	20
+../Core/Src/bms_master_comm.c:114:13:send_fault_line	4
+../Core/Src/bms_master_comm.c:123:6:BMS_MasterComm_PrintFaults	9
+../Core/Src/bms_master_comm.c:175:13:print_error_context	5
+../Core/Src/bms_master_comm.c:190:13:print_hex	11
+../Core/Src/bms_master_comm.c:215:6:BMS_MasterComm_PrintDiagnostics	11
+../Core/Src/bms_master_comm.c:262:6:slavestesteprint	20

@@ -1,7 +1,7 @@
 ../Core/Src/bms_relays.c:62:13:mon_seed	1
-../Core/Src/bms_relays.c:71:13:mon_update	5
-../Core/Src/bms_relays.c:97:6:BMS_Relays_Init	1
-../Core/Src/bms_relays.c:158:6:BMS_Relays_Task	44
-../Core/Src/bms_relays.c:324:18:BMS_Relays_GetState	1
-../Core/Src/bms_relays.c:329:13:BMS_Relays_GetStateString	5
-../Core/Src/bms_relays.c:341:6:BMS_Relays_GetMonitors	2
+../Core/Src/bms_relays.c:79:13:mon_update	5
+../Core/Src/bms_relays.c:109:6:BMS_Relays_Init	1
+../Core/Src/bms_relays.c:202:6:BMS_Relays_Task	1
+../Core/Src/bms_relays.c:436:18:BMS_Relays_GetState	1
+../Core/Src/bms_relays.c:444:13:BMS_Relays_GetStateString	5
+../Core/Src/bms_relays.c:459:6:BMS_Relays_GetMonitors	2
